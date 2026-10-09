@@ -56,13 +56,18 @@ O que este arquivo expõe
 # objeto amigável para não termos que fatiar `sys.argv` manualmente.
 import argparse
 
+# Biblioteca padrão: serializa estruturas Python simples (listas, dicts) em
+# texto JSON — usado pela flag `--json` para saída legível por máquina.
+import json
+
 # Biblioteca padrão: acesso a internos do interpretador — usamos para
 # escrever no stderr e sair do processo com um código de status específico.
 import sys
 
 # Biblioteca padrão: um decorador que transforma uma classe em um registro de
 # dados pequeno e imutável sem escrever código repetitivo de `__init__`.
-from dataclasses import dataclass
+# `asdict` converte uma instância de dataclass em um dict comum.
+from dataclasses import asdict, dataclass
 
 # Biblioteca padrão: uma dica de tipo que fixa um valor a um pequeno conjunto
 # fixo de strings (aqui: "high", "medium", "low"). O Mypy captura erros de digitação.
@@ -85,6 +90,15 @@ from rich.table import Table
 # Literals para conjuntos fixos pequenos.
 
 Confidence = Literal["high", "medium", "low"]
+
+# Mapa de cor por nível de confiança — compartilhado entre a tabela rich de
+# um único hash e a saída linha-a-linha do modo em lote (Desafio 2.1), para
+# que as duas saídas usem a mesma convenção de cor.
+CONFIDENCE_COLORS: dict[Confidence, str] = {
+    "high": "green",
+    "medium": "yellow",
+    "low": "cyan",
+}
 
 
 # =============================================================================
@@ -112,11 +126,17 @@ class HashCandidate:
     reason
         Explicação curta exibida ao lado do nome do algoritmo. Mantém a
         saída depurável — o usuário pode ver POR QUE cada palpite foi feito.
+    hashcat_mode
+        O número de modo `-m` do hashcat para este algoritmo, quando
+        conhecido (Desafio 2.2). `None` quando não temos uma entrada
+        confiável em HASHCAT_MODES — mais honesto do que adivinhar um
+        número errado.
     """
 
     algorithm: str
     confidence: Confidence
     reason: str
+    hashcat_mode: int | None = None
 
 
 # =============================================================================
@@ -162,6 +182,13 @@ PREFIX_RULES: list[tuple[str, str, str]] = [
     ("pbkdf2_sha1$", "Django PBKDF2-SHA1", "hash de senha legado do Django"),
     ("bcrypt_sha256$", "Django bcrypt-SHA256", "wrapper bcrypt do Django"),
     ("argon2$", "Django Argon2", "wrapper Argon2 do Django"),
+
+
+    # Password-Based Key Derivation Function 2) — hashes antigos do Atlassian / Jira
+    ("$pbkdf2$", "PBKDF2-SHA1 (Atlassian)", "hashes antigos do Atlassian / Jira"),
+
+
+
     # Esquemas de senha LDAP — carga base64 após o marcador
     ("{SSHA}", "LDAP SSHA", "SHA-1 com salt do LDAP (carga base64)"),
     ("{SHA}", "LDAP SHA", "SHA-1 do LDAP (carga base64)"),
@@ -191,6 +218,17 @@ _HEX_UPPER_CHARSET: frozenset[str] = frozenset("0123456789ABCDEF")
 HEX_LENGTH_RULES: dict[int, list[str]] = {
     # 16 caracteres hex = 8 bytes = 64 bits. Saída do OLD_PASSWORD() do MySQL.
     16: ["MySQL323", "CRC-64"],
+
+
+    
+    # 24 caracteres hex = 12 bytes = 96 bits. Raro — Tiger-128 e alguns hashes
+    # personalizados antigos produzem esse comprimento.
+    24: ["Tiger-128"],
+
+
+
+
+
     # 32 caracteres hex = 16 bytes = 128 bits
     32: ["MD5", "NTLM", "MD4", "RIPEMD-128"],
     # 40 caracteres hex = 20 bytes = 160 bits
@@ -207,6 +245,47 @@ HEX_LENGTH_RULES: dict[int, list[str]] = {
     96: ["SHA-384", "SHA3-384"],
     # 128 caracteres hex = 64 bytes = 512 bits
     128: ["SHA-512", "SHA3-512", "BLAKE2b-512", "Whirlpool"],
+}
+
+
+# =============================================================================
+# Modos do hashcat — Desafio 2.2
+# =============================================================================
+# O hashcat atribui um número de modo (`-m`) a cada algoritmo que ele sabe
+# quebrar. Mapeamento PARCIAL — cobrimos apenas os formatos para os quais
+# temos certeza do número, com base na tabela oficial em
+# https://hashcat.net/wiki/doku.php?id=example_hashes. Quando um algoritmo
+# não aparece aqui, `HashCandidate.hashcat_mode` fica `None` — preferimos
+# omitir a sugestão a arriscar um número errado.
+
+HASHCAT_MODES: dict[str, int] = {
+    "MD5": 0,
+    "MD4": 900,
+    "SHA-1": 100,
+    "SHA-256": 1400,
+    "SHA-512": 1700,
+    "SHA3-224": 17300,
+    "SHA3-256": 17400,
+    "SHA3-384": 17500,
+    "SHA3-512": 17600,
+    "BLAKE2b-512": 600,
+    "RIPEMD-160": 6000,
+    "Whirlpool": 6100,
+    "NTLM": 1000,
+    "LDAP SHA": 101,
+    "LDAP SSHA": 111,
+    "MD5 crypt": 500,
+    "Apache MD5-crypt": 1600,
+    "SHA-256 crypt": 7400,
+    "SHA-512 crypt": 1800,
+    "bcrypt": 3200,
+    "phpass": 400,
+    "DES crypt": 1500,
+    "MySQL323": 200,
+    "MySQL5": 300,
+    "NetNTLMv1": 5500,
+    "NetNTLMv2": 5600,
+    "Django PBKDF2-SHA256": 10000,
 }
 
 
@@ -266,6 +345,46 @@ def _is_descrypt(text: str) -> bool:
     )
 
 
+# Base58 — alfabeto sem `0`, `O`, `I`, `l` (evita confusão visual entre
+# esses caracteres). Usado por endereços Bitcoin e CIDs do IPFS.
+_BASE58_CHARSET: frozenset[str] = frozenset(
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+)
+# Comprimento mínimo escolhido para reduzir falsos positivos em palavras
+# curtas comuns — endereços Bitcoin legados têm 25–34 caracteres; CIDs
+# IPFS v0 têm 46. 20 é um piso razoável, não uma garantia.
+_BASE58_MIN_LENGTH = 20
+
+# Base32 — maiúsculas + dígitos 2-7 (RFC 4648, sem padding `=` aqui).
+# Usado por segredos TOTP e endereços onion do Tor v3.
+_BASE32_CHARSET: frozenset[str] = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+# Segredos TOTP comuns (ex.: o exemplo clássico "JBSWY3DPEHPK3PXP") já têm
+# 16 caracteres; onion v3 tem 56. 16 é o piso.
+_BASE32_MIN_LENGTH = 16
+
+
+def _is_base58_like(text: str) -> bool:
+    """
+    Retorna True se `text` tiver aparência de Base58 (Bitcoin, IPFS).
+
+    Isso é uma pista de FORMA, não uma certeza — por isso quem chama
+    sempre reporta confiança BAIXA. Muitas strings aleatórias cabem
+    tecnicamente no alfabeto Base58.
+    """
+    return len(text) >= _BASE58_MIN_LENGTH and all(
+        c in _BASE58_CHARSET for c in text
+    )
+
+
+def _is_base32_like(text: str) -> bool:
+    """
+    Retorna True se `text` tiver aparência de Base32 (TOTP, Tor onion v3).
+    """
+    return len(text) >= _BASE32_MIN_LENGTH and all(
+        c in _BASE32_CHARSET for c in text
+    )
+
+
 # =============================================================================
 # O identificador propriamente dito
 # =============================================================================
@@ -289,8 +408,11 @@ def identify(raw_input: str) -> list[HashCandidate]:
        O primeiro item recebe confiança MÉDIA; o resto BAIXA.
     4. Se a entrada tiver o formato `$<algo>$...` mas nenhuma regra de prefixo
        correspondeu, recorre a uma correspondência genérica de string PHC (confiança BAIXA).
-    5. Se a entrada parecer um JWT (`eyJ...`) ou um blob base64 (contém `+`, `/`, ou `=`),
-       informa isso com confiança BAIXA — estes não são hashes.
+    5. Pistas de "isso não é um hash" (confiança BAIXA, Desafio 2.3 estendeu esta
+       etapa): URL (`http://`/`https://`), JWT (`eyJ...`), hex com prefixo `0x`
+       (endereço Ethereum / endereço de memória), blob base64 (contém `+`, `/`
+       ou `=`), Base32 (segredos TOTP, onion v3 do Tor) e Base58 (endereços
+       Bitcoin, CIDs do IPFS).
     6. Se nada corresponder, retorna uma lista vazia.
 
     Parâmetros
@@ -320,6 +442,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
                     algorithm=algorithm,
                     confidence="high",
                     reason=f"prefixo `{prefix}` — {note}",
+                    hashcat_mode=HASHCAT_MODES.get(algorithm),
                 )
             ]
 
@@ -339,6 +462,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
                     algorithm="NetNTLMv2",
                     confidence="high",
                     reason="formato usuario::dominio:desafio:hmac(32 hex):blob",
+                    hashcat_mode=HASHCAT_MODES.get("NetNTLMv2"),
                 )
             ]
         # Layout NetNTLMv1:
@@ -349,6 +473,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
                     algorithm="NetNTLMv1",
                     confidence="high",
                     reason="formato usuario::dominio:lm(48 hex):nt(48 hex):desafio",
+                    hashcat_mode=HASHCAT_MODES.get("NetNTLMv1"),
                 )
             ]
 
@@ -359,6 +484,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
                 algorithm="MySQL5",
                 confidence="high",
                 reason="começa com `*` seguido por 40 caracteres hex maiúsculos",
+                hashcat_mode=HASHCAT_MODES.get("MySQL5"),
             )
         ]
 
@@ -369,6 +495,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
                 algorithm="DES crypt",
                 confidence="medium",
                 reason="13 caracteres em `./0-9A-Za-z` — formato legado /etc/passwd",
+                hashcat_mode=HASHCAT_MODES.get("DES crypt"),
             )
         ]
 
@@ -390,6 +517,7 @@ def identify(raw_input: str) -> list[HashCandidate]:
                     algorithm=algorithm,
                     confidence=confidence,
                     reason=f"{len(text)} caracteres hex — {label}",
+                    hashcat_mode=HASHCAT_MODES.get(algorithm),
                 )
             )
         return candidates
@@ -414,7 +542,22 @@ def identify(raw_input: str) -> list[HashCandidate]:
                 ]
 
     # ----- Passo 5: dicas de formatos que não são hashes -----
-    # Iniciantes costumam colar JWTs ou blobs base64 em um identificador de hash.
+    # Iniciantes costumam colar URLs, JWTs, endereços ou blobs codificados em
+    # um identificador de hash. Cada ramo abaixo é heurística de FORMA, não
+    # certeza — por isso toda confiança aqui é BAIXA (Desafio 2.3).
+
+    # URLs — checadas ANTES do blob base64, porque uma URL com query string
+    # (`?token=abc=`) também contém `=` e seria mal classificada se essa
+    # checagem viesse depois.
+    if text.startswith("http://") or text.startswith("https://"):
+        return [
+            HashCandidate(
+                algorithm="URL (não é um hash)",
+                confidence="low",
+                reason="começa com http:// ou https:// — é um link, não um hash",
+            )
+        ]
+
     if text.startswith("eyJ"):
         # JWTs sempre começam com `eyJ` porque seu cabeçalho JSON `{"alg":...}`
         # em base64 começa com esses três caracteres.
@@ -425,6 +568,19 @@ def identify(raw_input: str) -> list[HashCandidate]:
                 reason='prefixo `eyJ` é o base64 de `{"` — JWT, não é um hash',
             )
         ]
+
+    # Hex com prefixo 0x — endereços Ethereum ou endereços de memória.
+    # `_is_hex` já teria capturado o hex puro no Passo 3; chegamos aqui só
+    # por causa do `0x` na frente, que não é um caractere hex válido.
+    if text[:2].lower() == "0x" and len(text) > 2 and _is_hex(text[2:]):
+        return [
+            HashCandidate(
+                algorithm="Hex com prefixo 0x (não é um hash)",
+                confidence="low",
+                reason="prefixo `0x` indica endereço Ethereum ou endereço de memória",
+            )
+        ]
+
     if any(c in text for c in "+/=") and len(text) > 8:
         # Hashes hex NUNCA contêm `+`, `/`, ou `=`.
         return [
@@ -432,6 +588,28 @@ def identify(raw_input: str) -> list[HashCandidate]:
                 algorithm="Blob Base64 (não é um hash)",
                 confidence="low",
                 reason="contém caracteres exclusivos de base64 (`+`, `/`, `=`)",
+            )
+        ]
+
+    # Base32 — checado ANTES do Base58: o alfabeto de Base32 (maiúsculas + 2-7)
+    # é mais restrito, então uma correspondência aqui é um sinal mais forte.
+    if _is_base32_like(text):
+        return [
+            HashCandidate(
+                algorithm="Base32 (não é um hash)",
+                confidence="low",
+                reason="alfabeto A-Z/2-7 — usado por segredos TOTP e onion v3 do Tor",
+            )
+        ]
+
+    # Base58 — alfabeto mais amplo (maiúsculas, minúsculas e dígitos exceto 0),
+    # por isso vem por último entre as pistas de "forma".
+    if _is_base58_like(text):
+        return [
+            HashCandidate(
+                algorithm="Base58 (não é um hash)",
+                confidence="low",
+                reason="alfabeto Base58 — usado por endereços Bitcoin e CIDs do IPFS",
             )
         ]
 
@@ -457,7 +635,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "hash",
-        help="A string de hash a identificar (envolva em aspas simples se contiver $).",
+        nargs="?",
+        default=None,
+        help=(
+            "A string de hash a identificar (envolva em aspas simples se contiver $). "
+            "Se omitido, lê de --file ou do stdin (um hash por linha)."
+        ),
     )
     parser.add_argument(
         "--top",
@@ -465,6 +648,21 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Mostra no máximo este número de candidatos (padrão: 5).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Imprime os candidatos como JSON em vez da tabela colorida.",
+    )
+    parser.add_argument(
+        "--file",
+        "-f",
+        type=argparse.FileType("r", encoding="utf-8"),
+        default=None,
+        help=(
+            "Lê hashes de um arquivo, um por linha, em vez de um único "
+            "argumento posicional (Desafio 2.1)."
+        ),
     )
     return parser
 
@@ -484,22 +682,75 @@ def _render_table(
     )
     table.add_column("algoritmo", style="bold white", no_wrap=True)
     table.add_column("confiança", no_wrap=True)
+    table.add_column("hashcat -m", style="dim", no_wrap=True)
     table.add_column("motivo", style="dim")
 
-    # Cores para os níveis de confiança.
-    confidence_colors: dict[Confidence, str] = {
-        "high": "green",
-        "medium": "yellow",
-        "low": "cyan",
-    }
     for candidate in candidates:
-        color = confidence_colors[candidate.confidence]
+        color = CONFIDENCE_COLORS[candidate.confidence]
+        hashcat_cell = (
+            str(candidate.hashcat_mode) if candidate.hashcat_mode is not None else "-"
+        )
         table.add_row(
             candidate.algorithm,
             f"[{color}]{candidate.confidence}[/{color}]",
+            hashcat_cell,
             candidate.reason,
         )
     console.print(table)
+
+
+def _read_batch_inputs(args: argparse.Namespace) -> list[str]:
+    """
+    Reúne as linhas de entrada do modo em lote (Desafio 2.1).
+
+    Lê de `--file` quando fornecido; caso contrário, lê do stdin (permite
+    `cat hashes.txt | hashid`). Linhas vazias são descartadas.
+    """
+    if args.file is not None:
+        with args.file as handle:
+            lines = handle.read().splitlines()
+    else:
+        lines = sys.stdin.read().splitlines()
+    return [line for line in lines if line.strip()]
+
+
+def _run_batch(
+    raw_inputs: list[str],
+    *,
+    top: int,
+    as_json: bool,
+    console: Console,
+) -> int:
+    """
+    Identifica cada linha de `raw_inputs` e imprime um resultado por linha.
+
+    Fluxos reais trazem arquivos com milhões de hashes — uma tabela rich por
+    hash seria inviável de ler, então aqui a saída é sempre uma linha por
+    entrada (ou um objeto JSON por linha, com `--json`), nunca uma tabela.
+
+    Retorna 0 se pelo menos uma entrada foi identificada, 1 se nenhuma foi.
+    """
+    any_match = False
+    for raw in raw_inputs:
+        candidates = identify(raw)
+        trimmed = candidates[:top]
+        if trimmed:
+            any_match = True
+
+        if as_json:
+            payload = {"input": raw, "candidates": [asdict(c) for c in trimmed]}
+            print(json.dumps(payload))
+        elif trimmed:
+            top_candidate = trimmed[0]
+            color = CONFIDENCE_COLORS[top_candidate.confidence]
+            console.print(
+                f"{raw.strip()} -> [bold]{top_candidate.algorithm}[/bold] "
+                f"[{color}]{top_candidate.confidence}[/{color}]"
+            )
+        else:
+            console.print(f"{raw.strip()} -> [red]sem identificação[/red]")
+
+    return 0 if any_match else 1
 
 
 def main() -> int:
@@ -510,7 +761,22 @@ def main() -> int:
     args = parser.parse_args()
     console = Console()
 
+    # Sem hash posicional: modo em lote, lendo de --file ou stdin (Desafio 2.1).
+    if args.hash is None:
+        raw_inputs = _read_batch_inputs(args)
+        return _run_batch(raw_inputs, top=args.top, as_json=args.json, console=console)
+
     candidates = identify(args.hash)
+
+    if args.json:
+        # Campo de nível superior `input` preserva a string original, para que
+        # uma ferramenta seguinte na pipeline saiba o que foi identificado.
+        payload = {
+            "input": args.hash,
+            "candidates": [asdict(candidate) for candidate in candidates[: args.top]],
+        }
+        print(json.dumps(payload, indent=2))
+        return 0 if candidates else 1
 
     if not candidates:
         console.print(
@@ -525,11 +791,19 @@ def main() -> int:
     _render_table(args.hash, trimmed, console)
 
     # Dica útil — direciona o usuário para o cracker após a identificação.
+    # Quando conhecemos o modo do hashcat (Desafio 2.2), sugerimos o comando
+    # exato em vez de um texto genérico.
     if trimmed[0].confidence == "high":
-        console.print(
-            "\n[dim]Próximo passo: tente o modo de quebra correspondente "
-            "(veja ../../beginner/hash-cracker).[/dim]"
-        )
+        if trimmed[0].hashcat_mode is not None:
+            console.print(
+                f"\n[dim]Próximo passo: hashcat -m {trimmed[0].hashcat_mode} -a 0 "
+                f"'{args.hash}' wordlist.txt[/dim]"
+            )
+        else:
+            console.print(
+                "\n[dim]Próximo passo: tente o modo de quebra correspondente "
+                "(veja ../../beginner/hash-cracker).[/dim]"
+            )
 
     return 0
 

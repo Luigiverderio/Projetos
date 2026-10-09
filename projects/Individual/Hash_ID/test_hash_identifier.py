@@ -64,13 +64,26 @@ no topo do ranking.
 #   - `PREFIX_RULES` — a tabela de busca de prefixos (usada pelo teste
 #                      parametrizado "every row is covered" no final deste arquivo)
 
+# Biblioteca padrão: usada para simular `sys.stdin` nos testes do modo em lote.
+import io
+
+# Biblioteca padrão: usada para decodificar a saída de `--json` nos testes da CLI.
+import json
+
+# Biblioteca padrão: usada para simular `sys.argv` ao testar a CLI diretamente.
+import sys
+
+# Biblioteca padrão: dica de tipo para o fixture `tmp_path` do pytest.
+from pathlib import Path
+
 # Terceiros: o próprio executor de testes. Também precisamos importá-lo aqui
 # para podermos usar seu decorador `@pytest.mark.parametrize` abaixo.
 import pytest
 
 # Local: nosso próprio módulo. Extraímos as peças públicas sob teste —
-# a tabela de regras de prefixo, a dataclass de resultado e a função de entrada.
-from hash_identifier import PREFIX_RULES, HashCandidate, identify
+# a tabela de regras de prefixo, a dataclass de resultado, a função de
+# identificação e o ponto de entrada da CLI (para os testes de `--json`).
+from hash_identifier import PREFIX_RULES, HashCandidate, identify, main
 
 # =============================================================================
 # Correspondências de prefixo (alta confiança)
@@ -152,6 +165,18 @@ def test_apr1_prefix_is_recognized() -> None:
     sample = "$apr1$rsalt$mp7TYYDvbgvNCJN3JTd6q1"
     candidates = identify(sample)
     assert candidates[0].algorithm == "Apache MD5-crypt"
+    assert candidates[0].confidence == "high"
+
+
+def test_pbkdf2_atlassian_prefix_is_recognized() -> None:
+    """
+    Hashes antigos do Atlassian / Jira começam com `$pbkdf2$`
+
+    Desafio 1.1 — PBKDF2 autônomo, sem o wrapper do Django.
+    """
+    sample = "$pbkdf2$10000$cmFuZG9tc2FsdA$aGFzaHZhbHVlaGVyZQ"
+    candidates = identify(sample)
+    assert candidates[0].algorithm == "PBKDF2-SHA1 (Atlassian)"
     assert candidates[0].confidence == "high"
 
 
@@ -263,6 +288,18 @@ def test_mysql323_length_returns_mysql323_first() -> None:
     # MySQL323 fica ACIMA de CRC-64 porque em um contexto de segurança,
     # o MySQL323 é de longe a fonte mais provável.
     assert candidates[0].algorithm == "MySQL323"
+    assert candidates[0].confidence == "medium"
+
+
+def test_tiger128_length_returns_tiger128() -> None:
+    """
+    24 caracteres hex apontam para Tiger-128 (comprimento raro, 96 bits)
+
+    Desafio 1.2 — HEX_LENGTH_RULES não tinha entrada para 24 caracteres.
+    """
+    sample = "a" * 24
+    candidates = identify(sample)
+    assert candidates[0].algorithm == "Tiger-128"
     assert candidates[0].confidence == "medium"
 
 
@@ -388,6 +425,66 @@ def test_base64_blob_is_called_out_as_not_a_hash() -> None:
     assert "Base64" in candidates[0].algorithm
 
 
+def test_url_is_called_out_as_not_a_hash() -> None:
+    """
+    URLs começam com http:// ou https:// e devem ser sinalizadas como não-hash
+
+    Desafio 2.3 — a query string (`?token=...=`) contém `=`, então esse
+    ramo tem que vir ANTES do ramo de blob base64 ou seria mal classificado.
+    """
+    sample = "https://example.com/reset?token=abc123=="
+    candidates = identify(sample)
+
+    assert candidates
+    assert "URL" in candidates[0].algorithm
+    assert candidates[0].confidence == "low"
+
+
+def test_0x_prefixed_hex_is_called_out_as_not_a_hash() -> None:
+    """
+    Hex com prefixo `0x` é um endereço Ethereum / de memória, não um hash bruto
+
+    Desafio 2.3. O `x` não é um dígito hex válido, então `_is_hex` já
+    rejeita a string inteira no Passo 3 — é por isso que esse ramo
+    precisa existir separadamente no Passo 5.
+    """
+    sample = "0x" + "a" * 40
+    candidates = identify(sample)
+
+    assert candidates
+    assert "0x" in candidates[0].algorithm
+    assert candidates[0].confidence == "low"
+
+
+def test_base32_like_string_is_called_out_as_not_a_hash() -> None:
+    """
+    Segredos TOTP usam Base32 (maiúsculas + dígitos 2-7)
+
+    Desafio 2.3. Este é o exemplo clássico de segredo TOTP usado na
+    documentação do pyotp (decodifica para "Hello!\\xde\\xad\\xbe\\xef").
+    """
+    sample = "JBSWY3DPEHPK3PXP"
+    candidates = identify(sample)
+
+    assert candidates
+    assert "Base32" in candidates[0].algorithm
+    assert candidates[0].confidence == "low"
+
+
+def test_base58_like_string_is_called_out_as_not_a_hash() -> None:
+    """
+    Endereços Bitcoin usam Base58 (sem `0`, `O`, `I`, `l`)
+
+    Desafio 2.3. Endereço de doação conhecido, usado como exemplo didático.
+    """
+    sample = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+    candidates = identify(sample)
+
+    assert candidates
+    assert "Base58" in candidates[0].algorithm
+    assert candidates[0].confidence == "low"
+
+
 # =============================================================================
 # HashCandidate é imutável
 # =============================================================================
@@ -421,6 +518,63 @@ def test_hash_candidate_is_frozen() -> None:
 
 
 # =============================================================================
+# Modo do hashcat (hashcat_mode)
+# =============================================================================
+# Desafio 2.2: HashCandidate ganhou um campo opcional `hashcat_mode`,
+# preenchido a partir da tabela HASHCAT_MODES quando conhecemos o número.
+
+
+def test_md5_candidate_includes_its_hashcat_mode() -> None:
+    """
+    MD5 é o modo 0 do hashcat — o mais citado de todos
+    """
+    sample = "5f4dcc3b5aa765d61d8327deb882cf99"
+    candidates = identify(sample)
+    assert candidates[0].hashcat_mode == 0
+
+
+def test_bcrypt_candidate_includes_its_hashcat_mode() -> None:
+    """
+    bcrypt é o modo 3200 do hashcat
+    """
+    sample = "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQNQy.uK4Of2T7G"
+    candidates = identify(sample)
+    assert candidates[0].hashcat_mode == 3200
+
+
+def test_algorithm_without_a_known_hashcat_mode_is_none() -> None:
+    """
+    Quando não temos uma entrada confiável em HASHCAT_MODES, o campo é None
+
+    Argon2id ainda não está na nossa tabela — melhor omitir do que
+    arriscar um número de modo errado.
+    """
+    sample = "$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHQ$aGFzaA"
+    candidates = identify(sample)
+    assert candidates[0].hashcat_mode is None
+
+
+def test_cli_suggests_the_exact_hashcat_command_when_mode_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A dica de "próximo passo" deve incluir `-m <modo>` quando o conhecemos
+
+    A dica só aparece para candidatos de confiança HIGH, então usamos um
+    hash bcrypt (correspondência de prefixo) em vez de um MD5 (que é
+    apenas MEDIUM, por vir de uma regra de comprimento).
+    """
+    sample = "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQNQy.uK4Of2T7G"
+    monkeypatch.setattr(sys, "argv", ["hashid", sample])
+
+    main()
+    out = capsys.readouterr().out
+
+    assert "hashcat -m 3200 -a 0" in out
+
+
+# =============================================================================
 # Cobertura abrangente da tabela PREFIX_RULES
 # =============================================================================
 # Este último teste garante que CADA linha de PREFIX_RULES seja exercitada,
@@ -428,6 +582,146 @@ def test_hash_candidate_is_frozen() -> None:
 #
 # `@pytest.mark.parametrize(name, values)` é o mecanismo do pytest para
 # expandir UMA função de teste em MUITOS casos de teste.
+
+
+# =============================================================================
+# Flag --json da CLI
+# =============================================================================
+# Desafio 1.3: --json imprime os candidatos como JSON em vez da tabela rich.
+# Testamos chamando main() diretamente, com sys.argv simulado via monkeypatch
+# e a saída capturada pelo fixture `capsys` do pytest.
+
+
+def test_json_flag_outputs_valid_json_for_a_known_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    `--json` deve imprimir um objeto JSON com `input` e `candidates`
+    """
+    sample = "5f4dcc3b5aa765d61d8327deb882cf99"
+    monkeypatch.setattr(sys, "argv", ["hashid", "--json", sample])
+
+    exit_code = main()
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    # O campo `input` preserva a string original, não processada.
+    assert payload["input"] == sample
+    assert payload["candidates"][0]["algorithm"] == "MD5"
+    assert payload["candidates"][0]["confidence"] == "medium"
+
+
+def test_json_flag_with_no_match_returns_empty_list_and_exit_code_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    Entrada não reconhecida ainda produz JSON válido, só que com lista vazia
+    """
+    monkeypatch.setattr(sys, "argv", ["hashid", "--json", "isso nao e um hash"])
+
+    exit_code = main()
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert payload["candidates"] == []
+
+
+# =============================================================================
+# Modo em lote — `--file` e stdin (Desafio 2.1)
+# =============================================================================
+# Sem o argumento posicional `hash`, a CLI lê de --file ou do stdin, um hash
+# por linha, e imprime um resultado por linha (nunca uma tabela rich).
+
+
+def test_file_flag_reads_hashes_from_a_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    `--file` lê um hash por linha e identifica cada um
+    """
+    hashes_file = tmp_path / "hashes.txt"
+    hashes_file.write_text(
+        "5f4dcc3b5aa765d61d8327deb882cf99\n"
+        "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQNQy.uK4Of2T7G\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["hashid", "--file", str(hashes_file)])
+
+    exit_code = main()
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "MD5" in out
+    assert "bcrypt" in out
+
+
+def test_stdin_is_used_when_no_hash_or_file_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    `cat hashes.txt | hashid` deve funcionar — sem posicional, sem --file
+    """
+    monkeypatch.setattr(sys, "argv", ["hashid"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("5f4dcc3b5aa765d61d8327deb882cf99\n"))
+
+    exit_code = main()
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "MD5" in out
+
+
+def test_batch_mode_skips_blank_lines() -> None:
+    """
+    Linhas vazias no arquivo/stdin não geram candidatos "sem identificação"
+    """
+    assert identify("") == []
+
+
+def test_batch_mode_with_json_emits_one_json_object_per_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    `--json` no modo em lote imprime um objeto JSON por linha (JSON Lines),
+    não um array único — assim a saída pode ser processada em streaming.
+    """
+    monkeypatch.setattr(sys, "argv", ["hashid", "--json"])
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO("5f4dcc3b5aa765d61d8327deb882cf99\nisso nao e um hash\n"),
+    )
+
+    exit_code = main()
+    lines = capsys.readouterr().out.strip().splitlines()
+
+    assert exit_code == 0
+    first, second = (json.loads(line) for line in lines)
+    assert first["input"] == "5f4dcc3b5aa765d61d8327deb882cf99"
+    assert first["candidates"][0]["algorithm"] == "MD5"
+    assert second["candidates"] == []
+
+
+def test_batch_mode_returns_exit_code_one_when_nothing_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Se NENHUMA linha do lote for identificada, o código de saída é 1
+    """
+    monkeypatch.setattr(sys, "argv", ["hashid"])
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO("isso nao e um hash\noutro texto qualquer\n")
+    )
+
+    exit_code = main()
+
+    assert exit_code == 1
 
 
 @pytest.mark.parametrize("prefix,algorithm,_note", PREFIX_RULES)
